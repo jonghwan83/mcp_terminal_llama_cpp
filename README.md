@@ -31,6 +31,37 @@
 
 ---
 
+## 권한 확인 (Permission Checking)
+
+MCP 도구 실행 전에 사용자 승인을 받도록 설정할 수 있습니다.
+
+### terminal.py에서 권한 확인 활성화
+`terminal.py`에서 기본값으로 권한 확인이 **활성화**되어 있습니다.
+각 도구 실행 전에 사용자에게 승인을 요청합니다.
+
+권한 확인을 비활성화하려면 `terminal.py`의 다음 줄을 수정하세요:
+```python
+ASK_PERMISSION = False  # 권한 확인 비활성화
+```
+
+### mcp_server.py에서 권한 확인 활성화
+MCP 서버 모드에서는 기본값으로 권한 확인이 **비활성화**되어 있습니다.
+환경변수를 통해 권한 확인을 활성화할 수 있습니다:
+
+```bash
+# 권한 확인 활성화
+export MCP_ASK_PERMISSION=true
+python mcp_server.py
+
+# 또는
+MCP_ASK_PERMISSION=true python mcp_server.py
+```
+
+권한 확인이 활성화되면, 도구 사용 시 퍼미션 요청 메시지가 반환되며,
+클라이언트(Claude 등)가 'approved'로 응답할 때까지 도구가 실행되지 않습니다.
+
+---
+
 ## 설치
 
 ```bash

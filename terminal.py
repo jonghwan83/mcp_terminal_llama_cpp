@@ -45,6 +45,9 @@ VERSION = "0.1.0"
 SUMMARY_TOKEN_THRESHOLD = 2000   # approximate tokens; summarize when exceeded
 SUMMARY_KEEP_LAST = 2            # keep this many recent message pairs after summary
 
+# Permission checking
+ASK_PERMISSION = True            # Set to False to disable permission prompts
+
 TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
@@ -240,7 +243,48 @@ def exec_list_dir(path: str = ".") -> str:
         return f"Error: {e}"
 
 
+def _format_tool_details(name: str, args: dict[str, Any]) -> str:
+    """Format tool call details for permission display."""
+    if name == "bash_exec":
+        return f"Command: {args.get('command', '')}"
+    elif name == "read_file":
+        return f"File: {args.get('path', '')}"
+    elif name == "write_file":
+        path = args.get("path", "")
+        content = args.get("content", "")
+        content_preview = content[:50] + ("…" if len(content) > 50 else "")
+        return f"File: {path}\nContent: {content_preview}"
+    elif name == "list_dir":
+        return f"Directory: {args.get('path', '.')}"
+    return str(args)
+
+
+def ask_tool_permission(name: str, args: dict[str, Any]) -> bool:
+    """Ask user permission to execute a tool. Returns True if approved."""
+    if not ASK_PERMISSION:
+        return True
+    
+    console.print()
+    console.print(f"  [warn]Tool Request:[/warn] [tool.name]{name}[/tool.name]")
+    details = _format_tool_details(name, args)
+    for line in details.split("\n"):
+        console.print(f"    {line}")
+    
+    try:
+        return Confirm.ask(
+            "  Allow this operation",
+            default=False,
+            console=console
+        )
+    except EOFError:
+        # If EOF reached during confirmation, deny permission
+        return False
+
+
 def dispatch_tool(name: str, args: dict[str, Any]) -> str:
+    if not ask_tool_permission(name, args):
+        return "Operation denied by user."
+    
     if name == "bash_exec":
         return exec_bash(args["command"], int(args.get("timeout", 30)))
     if name == "read_file":
@@ -250,6 +294,21 @@ def dispatch_tool(name: str, args: dict[str, Any]) -> str:
     if name == "list_dir":
         return exec_list_dir(args.get("path", "."))
     return f"Unknown tool: {name}"
+
+
+def _run_tool_with_ui(name: str, args: dict[str, Any]) -> str:
+    """Run a tool with UI behavior that won't block permission prompts."""
+    if ASK_PERMISSION:
+        # Permission prompt uses stdin interaction; avoid running it under Live spinner.
+        return dispatch_tool(name, args)
+
+    with Live(
+        Spinner("line", text="  [status]executing …[/status]"),
+        console=console,
+        refresh_per_second=12,
+        transient=True,
+    ):
+        return dispatch_tool(name, args)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -394,6 +453,12 @@ def stop_llama_server() -> None:
 
 
 _VALID_TOOLS = {s["function"]["name"] for s in TOOL_SCHEMAS}
+_FIRST_PARAM = {
+    "bash_exec": "command",
+    "read_file": "path",
+    "write_file": "path",
+    "list_dir": "path",
+}
 
 
 def _try_parse_tool_json(data: dict) -> dict | None:
@@ -414,12 +479,47 @@ def _parse_text_tool_calls(content: str) -> list[dict]:
     """Fallback parser for models that emit tool calls as plain text.
 
     Tried in order:
+    0. <bash_exec>{"command":"..."}</bash_exec>              — tool name as tag
     1. <tool_call>{"name":...,"arguments":...}</tool_call>   — Qwen 2.5 JSON
     2. <tool_call><function=NAME><parameter=K>V</parameter>  — Qwen 3.x XML
     3. Action: NAME / Action Input: {...}                    — ReAct format
     4. Bare JSON object with a known tool name               — generic fallback
     """
     results: list[dict] = []
+
+    # ── 0: <tool_name>…</tool_name> ───────────────────────────────────────────
+    for name in _VALID_TOOLS:
+        for m in re.finditer(rf"<{name}>(.*?)</{name}>", content, re.DOTALL):
+            body = m.group(1).strip()
+            if body.startswith("{{") and body.endswith("}}"):
+                body = body[1:-1]
+            # JSON arguments body
+            if body.startswith("{"):
+                try:
+                    data = json.loads(body)
+                    # Prefer explicit arguments/parameters/args key (check existence, not truthiness)
+                    if "arguments" in data:
+                        args = data["arguments"]
+                    elif "parameters" in data:
+                        args = data["parameters"]
+                    elif "args" in data:
+                        args = data["args"]
+                    else:
+                        args = {k: v for k, v in data.items() if k not in ("name", "function", "tool")}
+                    # Edge case: model wrote the command in "name" and left arguments empty
+                    # e.g. <bash_exec>{"name": "pwd", "arguments": {}}</bash_exec>
+                    if not args and "name" in data and data["name"] not in _VALID_TOOLS:
+                        args = {_FIRST_PARAM[name]: data["name"]}
+                    results.append({"name": name, "arguments": args})
+                    continue
+                except json.JSONDecodeError:
+                    pass
+            # Plain text body — treat as the first required argument
+            if body and name in _FIRST_PARAM:
+                results.append({"name": name, "arguments": {_FIRST_PARAM[name]: body}})
+
+    if results:
+        return results
 
     # ── 1 & 2: <tool_call>…</tool_call> ──────────────────────────────────────
     for tc_m in re.finditer(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL):
@@ -499,11 +599,21 @@ def _extract_json_objects(text: str) -> list[str]:
 # Session memory + auto-summarize
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = (
-    "You are a terminal assistant. "
-    "Use the provided tools to complete the user's task. "
-    "Be concise and only call tools when necessary."
-)
+SYSTEM_PROMPT = """\
+You are a terminal assistant. Complete the user's task using the available tools.
+Be concise. Only use tools when necessary.
+
+Available tools:
+- bash_exec(command, timeout=30) : execute a shell command
+- read_file(path)                : read a file
+- write_file(path, content)      : write a file
+- list_dir(path=".")             : list directory contents
+
+To call a tool, output its name and arguments as JSON:
+{"name": "bash_exec", "arguments": {"command": "ls -la"}}
+
+Call one tool at a time and wait for the result before continuing.\
+"""
 
 
 def _make_messages() -> list[dict]:
@@ -653,14 +763,13 @@ def run_task(task: str, llm: OpenAI, messages: list[dict]) -> None:
                     f"\n  [tool.name]{name}[/tool.name]  [tool.arg]{preview}[/tool.arg]"
                     f"  [label](text fallback)[/label]"
                 )
-                with Live(
-                    Spinner("line", text="  [status]executing …[/status]"),
-                    console=console,
-                    refresh_per_second=12,
-                    transient=True,
-                ):
-                    result = dispatch_tool(name, args)
+                result = _run_tool_with_ui(name, args)
                 _print_result(result)
+
+                if result == "Operation denied by user.":
+                    console.print("  [warn]Task stopped: tool execution was denied.[/warn]")
+                    return
+
                 result_parts.append(f"[{name}]\n{result}")
 
             messages.append({
@@ -682,16 +791,14 @@ def run_task(task: str, llm: OpenAI, messages: list[dict]) -> None:
                 f"  [tool.arg]{preview}[/tool.arg]"
             )
 
-            result: str
-            with Live(
-                Spinner("line", text="  [status]executing …[/status]"),
-                console=console,
-                refresh_per_second=12,
-                transient=True,
-            ):
-                result = dispatch_tool(tc.function.name, args)
+            result = _run_tool_with_ui(tc.function.name, args)
 
             _print_result(result)
+
+            if result == "Operation denied by user.":
+                console.print("  [warn]Task stopped: tool execution was denied.[/warn]")
+                return
+
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result}
             )

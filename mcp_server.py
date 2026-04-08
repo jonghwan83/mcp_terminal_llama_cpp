@@ -44,6 +44,9 @@ LLAMA_PORT = 8080
 LLAMA_BASE_URL = f"http://localhost:{LLAMA_PORT}/v1"
 MAX_AGENT_ITERATIONS = 10
 
+# Permission checking - set via MCP_ASK_PERMISSION environment variable
+ASK_PERMISSION = os.getenv("MCP_ASK_PERMISSION", "false").lower() in ("true", "1", "yes")
+
 # Tool schemas shared by both MCP and the LLM function-calling API
 _TOOL_SCHEMAS = [
     {
@@ -271,7 +274,37 @@ def exec_list_dir(path: str = ".") -> str:
         return f"Error: {e}"
 
 
+def _format_tool_details(name: str, args: dict[str, Any]) -> str:
+    """Format tool call details for permission display."""
+    if name == "bash_exec":
+        return f"Command: {args.get('command', '')}"
+    elif name == "read_file":
+        return f"File: {args.get('path', '')}"
+    elif name == "write_file":
+        path = args.get("path", "")
+        content = args.get("content", "")
+        content_preview = content[:100] + ("…" if len(content) > 100 else "")
+        return f"File: {path}\nContent preview: {content_preview}"
+    elif name == "list_dir":
+        return f"Directory: {args.get('path', '.')}"
+    return str(args)
+
+
+def _get_permission_request(name: str, args: dict[str, Any]) -> str:
+    """Generate a permission request message."""
+    details = _format_tool_details(name, args)
+    return (
+        f"⚠️  Permission Required\n\n"
+        f"Tool: {name}\n"
+        f"{details}\n\n"
+        f"This operation requires approval. Reply with 'approved' to proceed."
+    )
+
+
 def dispatch_tool(name: str, args: dict[str, Any]) -> str:
+    if ASK_PERMISSION:
+        return _get_permission_request(name, args)
+    
     if name == "bash_exec":
         return exec_bash(args["command"], int(args.get("timeout", 30)))
     if name == "read_file":
@@ -343,16 +376,54 @@ def _try_parse_tool_json(data: dict) -> dict | None:
     return {"name": name, "arguments": args}
 
 
+_FIRST_PARAM = {
+    "bash_exec": "command",
+    "read_file": "path",
+    "write_file": "path",
+    "list_dir": "path",
+}
+
+
 def _parse_text_tool_calls(content: str) -> list[dict]:
     """Fallback parser for models that emit tool calls as plain text.
 
     Tried in order:
+    0. <bash_exec>{"command":"..."}</bash_exec>              — tool name as tag
     1. <tool_call>{"name":...,"arguments":...}</tool_call>   — Qwen 2.5 JSON
     2. <tool_call><function=NAME><parameter=K>V</parameter>  — Qwen 3.x XML
     3. Action: NAME / Action Input: {...}                    — ReAct format
     4. Bare JSON object with a known tool name               — generic fallback
     """
     results: list[dict] = []
+
+    # ── 0: <tool_name>…</tool_name> ───────────────────────────────────────────
+    for name in _VALID_TOOLS:
+        for m in re.finditer(rf"<{name}>(.*?)</{name}>", content, re.DOTALL):
+            body = m.group(1).strip()
+            if body.startswith("{{") and body.endswith("}}"):
+                body = body[1:-1]
+            if body.startswith("{"):
+                try:
+                    data = json.loads(body)
+                    if "arguments" in data:
+                        args = data["arguments"]
+                    elif "parameters" in data:
+                        args = data["parameters"]
+                    elif "args" in data:
+                        args = data["args"]
+                    else:
+                        args = {k: v for k, v in data.items() if k not in ("name", "function", "tool")}
+                    if not args and "name" in data and data["name"] not in _VALID_TOOLS:
+                        args = {_FIRST_PARAM[name]: data["name"]}
+                    results.append({"name": name, "arguments": args})
+                    continue
+                except json.JSONDecodeError:
+                    pass
+            if body and name in _FIRST_PARAM:
+                results.append({"name": name, "arguments": {_FIRST_PARAM[name]: body}})
+
+    if results:
+        return results
 
     for tc_m in re.finditer(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL):
         body = tc_m.group(1).strip()
@@ -431,9 +502,16 @@ def run_agent_task(task: str, llm: OpenAI) -> str:
         {
             "role": "system",
             "content": (
-                "You are a terminal assistant. "
-                "Use the provided tools to complete the user's task. "
-                "Be concise and only call tools when necessary."
+                "You are a terminal assistant. Complete the user's task using the available tools.\n"
+                "Be concise. Only use tools when necessary.\n\n"
+                "Available tools:\n"
+                "- bash_exec(command, timeout=30) : execute a shell command\n"
+                "- read_file(path)                : read a file\n"
+                "- write_file(path, content)      : write a file\n"
+                "- list_dir(path=\".\")             : list directory contents\n\n"
+                "To call a tool, output its name and arguments as JSON:\n"
+                "{\"name\": \"bash_exec\", \"arguments\": {\"command\": \"ls -la\"}}\n\n"
+                "Call one tool at a time and wait for the result before continuing."
             ),
         },
         {"role": "user", "content": task},
