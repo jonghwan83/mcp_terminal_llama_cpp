@@ -102,6 +102,53 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "Find files by glob pattern under a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "default": "*.py"},
+                    "path": {"type": "string", "default": "."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_code",
+            "description": "Search text in files under a directory (supports regex).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string", "default": "."},
+                    "is_regex": {"type": "boolean", "default": False},
+                    "max_results": {"type": "integer", "default": 100},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_in_file",
+            "description": "Replace text in a file once (simple code editing helper).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,6 +290,78 @@ def exec_list_dir(path: str = ".") -> str:
         return f"Error: {e}"
 
 
+def exec_find_files(pattern: str = "*.py", path: str = ".") -> str:
+    try:
+        base = _resolve(path)
+        if not base.exists() or not base.is_dir():
+            return f"Error: directory not found: {base}"
+        files = sorted(
+            p for p in base.rglob(pattern)
+            if p.is_file()
+        )
+        if not files:
+            return "(no files found)"
+        lines = [str(p.relative_to(base)) for p in files]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def exec_search_code(
+    query: str,
+    path: str = ".",
+    is_regex: bool = False,
+    max_results: int = 100,
+) -> str:
+    try:
+        base = _resolve(path)
+        if not base.exists() or not base.is_dir():
+            return f"Error: directory not found: {base}"
+
+        if max_results <= 0:
+            max_results = 100
+
+        matcher = re.compile(query) if is_regex else None
+        results: list[str] = []
+
+        for f in sorted(p for p in base.rglob("*") if p.is_file()):
+            try:
+                text = f.read_text()
+            except Exception:
+                continue
+
+            for i, line in enumerate(text.splitlines(), 1):
+                matched = bool(matcher.search(line)) if matcher else (query in line)
+                if matched:
+                    rel = f.relative_to(base)
+                    results.append(f"{rel}:{i}: {line.strip()}")
+                    if len(results) >= max_results:
+                        return "\n".join(results)
+
+        return "\n".join(results) if results else "(no matches)"
+    except re.error as e:
+        return f"Error: invalid regex: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def exec_replace_in_file(path: str, old_text: str, new_text: str) -> str:
+    try:
+        p = _resolve(path)
+        if not p.exists() or not p.is_file():
+            return f"Error: file not found: {p}"
+
+        content = p.read_text()
+        if old_text not in content:
+            return "Error: old_text not found in file"
+
+        updated = content.replace(old_text, new_text, 1)
+        p.write_text(updated)
+        return f"Updated {p} (replaced first occurrence)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def _format_tool_details(name: str, args: dict[str, Any]) -> str:
     """Format tool call details for permission display."""
     if name == "bash_exec":
@@ -256,6 +375,16 @@ def _format_tool_details(name: str, args: dict[str, Any]) -> str:
         return f"File: {path}\nContent: {content_preview}"
     elif name == "list_dir":
         return f"Directory: {args.get('path', '.')}"
+    elif name == "find_files":
+        return f"Path: {args.get('path', '.')}\nPattern: {args.get('pattern', '*.py')}"
+    elif name == "search_code":
+        return (
+            f"Path: {args.get('path', '.')}\n"
+            f"Query: {args.get('query', '')}\n"
+            f"Regex: {args.get('is_regex', False)}"
+        )
+    elif name == "replace_in_file":
+        return f"File: {args.get('path', '')}\nReplace text in first occurrence"
     return str(args)
 
 
@@ -293,6 +422,17 @@ def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         return exec_write_file(args["path"], args["content"])
     if name == "list_dir":
         return exec_list_dir(args.get("path", "."))
+    if name == "find_files":
+        return exec_find_files(args.get("pattern", "*.py"), args.get("path", "."))
+    if name == "search_code":
+        return exec_search_code(
+            args["query"],
+            args.get("path", "."),
+            bool(args.get("is_regex", False)),
+            int(args.get("max_results", 100)),
+        )
+    if name == "replace_in_file":
+        return exec_replace_in_file(args["path"], args["old_text"], args["new_text"])
     return f"Unknown tool: {name}"
 
 
@@ -458,6 +598,9 @@ _FIRST_PARAM = {
     "read_file": "path",
     "write_file": "path",
     "list_dir": "path",
+    "find_files": "pattern",
+    "search_code": "query",
+    "replace_in_file": "path",
 }
 
 
@@ -608,6 +751,9 @@ Available tools:
 - read_file(path)                : read a file
 - write_file(path, content)      : write a file
 - list_dir(path=".")             : list directory contents
+- find_files(pattern="*.py", path=".") : find files by glob pattern
+- search_code(query, path=".", is_regex=False, max_results=100) : search code text
+- replace_in_file(path, old_text, new_text) : replace text once in a file
 
 To call a tool, output its name and arguments as JSON:
 {"name": "bash_exec", "arguments": {"command": "ls -la"}}
