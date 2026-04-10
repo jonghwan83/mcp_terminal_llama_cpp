@@ -1,45 +1,56 @@
-# 툴 추가 가이드
+# 툴 추가 가이드 (현재 구조 기준)
 
-새 툴을 추가할 때 수정해야 할 파일과 위치를 정리합니다.
+현재 프로젝트는 thin wrapper + shared module 구조입니다.
+
+- 실행 파일: `terminal.py`, `mcp_server.py` (wrapper)
+- 실제 런타임: `entrypoints/terminal_main.py`, `entrypoints/mcp_server_main.py`
+- 공통 툴 정의/실행: `app/*`
+
+즉, 새 툴은 보통 `terminal.py`, `mcp_server.py`를 직접 수정하지 않고
+`app/tool_registry.py` + `app/executor.py` + `app/validators.py` + `app/policy.py`를 수정합니다.
 
 ---
 
 ## 수정 파일 목록
 
-툴 하나를 추가하려면 **두 파일을 각각 4곳씩** 수정합니다.
-
 | 파일 | 수정 위치 | 역할 |
 |---|---|---|
-| `terminal.py` | `TOOL_SCHEMAS` | LLM에게 툴 설명 전달 |
-| `terminal.py` | `exec_*` 함수 | 실제 실행 로직 |
-| `terminal.py` | `dispatch_tool` | 이름 → 함수 라우팅 |
-| `terminal.py` | `_args_preview` | 터미널 UI 미리보기 |
-| `mcp_server.py` | `_TOOL_SCHEMAS` | LLM에게 툴 설명 전달 |
-| `mcp_server.py` | `exec_*` 함수 | 실제 실행 로직 |
-| `mcp_server.py` | `dispatch_tool` | 이름 → 함수 라우팅 |
-| `mcp_server.py` | `list_tools()` | MCP 클라이언트에 툴 노출 |
+| `app/tool_registry.py` | `TOOL_SCHEMAS` | 툴 스키마(LLM/MCP 공통) 등록 |
+| `app/executor.py` | `exec_*` 메서드 | 실제 실행 로직 구현 |
+| `app/executor.py` | `dispatch_tool` | 이름 → 실행 메서드 라우팅 |
+| `app/validators.py` | `validate_tool_args` | 인자 타입/범위/경로 검증 |
+| `app/policy.py` | `LOW_RISK_TOOLS` / `HIGH_RISK_TOOLS` | 권한 정책(allow/confirm/deny) |
+| `tests/*` | 테스트 추가 | 회귀 방지 |
+| `README.md` | 툴 목록 문서 갱신 | 사용자 안내 |
+
+참고:
+- MCP 노출은 `entrypoints/mcp_server_main.py`가 `build_mcp_tool_specs()`를 사용하므로,
+  일반 툴은 `app/tool_registry.py`만 수정해도 자동 반영됩니다.
+- `run_task`는 MCP 전용 특수 툴이라 entrypoint에서 별도로 append됩니다.
 
 ---
 
 ## 예시: `http_get` 툴 추가
 
-URL을 받아 HTTP GET 요청 결과를 반환하는 툴을 추가하는 전체 예시입니다.
-
-### 1. `terminal.py` — `TOOL_SCHEMAS`에 스키마 추가
+### 1) `app/tool_registry.py`에 스키마 추가
 
 ```python
-TOOL_SCHEMAS: list[dict] = [
-    # ... 기존 툴들 ...
+TOOL_SCHEMAS = [
+    # ... existing ...
     {
         "type": "function",
         "function": {
             "name": "http_get",
-            "description": "Send an HTTP GET request and return the response body.",
+            "description": "Send an HTTP GET request and return response text.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "URL to request"},
-                    "timeout": {"type": "integer", "default": 10},
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 10)",
+                        "default": 10,
+                    },
                 },
                 "required": ["url"],
             },
@@ -48,113 +59,81 @@ TOOL_SCHEMAS: list[dict] = [
 ]
 ```
 
-### 2. `terminal.py` — 실행 함수 추가
-
-`exec_list_dir` 아래에 추가합니다.
+### 2) `app/executor.py`에 실행 메서드 + 라우팅 추가
 
 ```python
-def exec_http_get(url: str, timeout: int = 10) -> str:
+def exec_http_get(self, url: str, timeout: int = 10) -> str:
+    error = self._validate("http_get", {"url": url, "timeout": timeout})
+    if error:
+        return error
     try:
         import urllib.request
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return r.read().decode(errors="replace")[:4000]
     except Exception as e:
         return f"Error: {e}"
+
+def dispatch_tool(self, tool_name: str, args: dict) -> str:
+    # ... existing ...
+    if tool_name == "http_get":
+        return self.exec_http_get(args["url"], int(args.get("timeout", 10)))
 ```
 
-### 3. `terminal.py` — `dispatch_tool`에 라우팅 추가
+### 3) `app/validators.py`에 검증 규칙 추가
 
 ```python
-def dispatch_tool(name: str, args: dict[str, Any]) -> str:
-    if name == "bash_exec":
-        return exec_bash(args["command"], int(args.get("timeout", 30)))
-    if name == "read_file":
-        return exec_read_file(args["path"])
-    if name == "write_file":
-        return exec_write_file(args["path"], args["content"])
-    if name == "list_dir":
-        return exec_list_dir(args.get("path", "."))
-    if name == "http_get":                              # ← 추가
-        return exec_http_get(args["url"], int(args.get("timeout", 10)))
-    return f"Unknown tool: {name}"
+if tool_name == "http_get":
+    url = args.get("url")
+    timeout = args.get("timeout", 10)
+    if not isinstance(url, str) or not url.strip():
+        return False, format_validation_error(tool_name, "url", "url is required")
+    if not isinstance(timeout, int) or timeout <= 0:
+        return False, format_validation_error(tool_name, "timeout", "timeout must be positive")
+    return True, None
 ```
 
-### 4. `terminal.py` — `_args_preview`에 미리보기 추가
+### 4) `app/policy.py`에 리스크 등급 반영
 
-터미널 UI에서 `  http_get  https://example.com` 처럼 표시됩니다.
-
-```python
-def _args_preview(tool_name: str, args: dict) -> str:
-    if tool_name == "bash_exec":
-        return args.get("command", "")
-    if tool_name in ("read_file", "write_file"):
-        return args.get("path", "")
-    if tool_name == "list_dir":
-        return args.get("path", ".")
-    if tool_name == "http_get":                         # ← 추가
-        return args.get("url", "")
-    return ", ".join(f"{k}={v}" for k, v in args.items())
-```
-
-### 5. `mcp_server.py` — `_TOOL_SCHEMAS`에 스키마 추가
-
-`terminal.py`의 1번과 동일한 내용을 `_TOOL_SCHEMAS`에 추가합니다.
-
-### 6. `mcp_server.py` — 실행 함수 추가
-
-`terminal.py`의 2번과 동일한 함수를 추가합니다.
-
-### 7. `mcp_server.py` — `dispatch_tool`에 라우팅 추가
-
-`terminal.py`의 3번과 동일하게 추가합니다.
-
-### 8. `mcp_server.py` — `list_tools()`에 MCP 툴 정의 추가
-
-`build_mcp_server` 함수 안의 `list_tools()`에 추가합니다.
+예: 읽기 성격이면 low-risk
 
 ```python
-@server.list_tools()
-async def list_tools() -> list[types.Tool]:
-    return [
-        # ... 기존 툴들 ...
-        types.Tool(
-            name="http_get",
-            description="Send an HTTP GET request and return the response body.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "timeout": {"type": "integer", "default": 10},
-                },
-                "required": ["url"],
-            },
-        ),
-    ]
+LOW_RISK_TOOLS = {"read_file", "list_dir", "find_files", "search_code", "http_get"}
 ```
 
 ---
 
-## 체크리스트
+## 테스트 추가 가이드
 
-툴 추가 후 확인:
+최소 권장:
 
-- [ ] `terminal.py` — `TOOL_SCHEMAS` 추가
-- [ ] `terminal.py` — `exec_*` 함수 추가
-- [ ] `terminal.py` — `dispatch_tool` 라우팅 추가
-- [ ] `terminal.py` — `_args_preview` 미리보기 추가
-- [ ] `mcp_server.py` — `_TOOL_SCHEMAS` 추가
-- [ ] `mcp_server.py` — `exec_*` 함수 추가
-- [ ] `mcp_server.py` — `dispatch_tool` 라우팅 추가
-- [ ] `mcp_server.py` — `list_tools()` 추가
-- [ ] `README.md` — 툴 목록 표 업데이트
+- `tests/test_executor.py`: 실행 성공/실패, 경계 케이스
+- `tests/test_policy.py`: 새 툴의 allow/confirm/deny 결과
+
+필요 시:
+
+- `tests/test_parser.py`: 파서 입력 포맷 영향이 있을 때
+- `tests/test_integration_runtime.py`: 스키마 노출 일관성 확인
+
+실행:
+
+```bash
+conda run -n mcp_dev pytest -q
+```
 
 ---
 
-## 참고: `_VALID_TOOLS`는 자동 갱신
+## 최종 체크리스트
 
-`_VALID_TOOLS`는 `TOOL_SCHEMAS` / `_TOOL_SCHEMAS`에서 자동으로 생성되므로 별도 수정이 필요 없습니다.
+- [ ] `app/tool_registry.py`에 새 툴 스키마 추가
+- [ ] `app/executor.py`에 `exec_*` 구현 + `dispatch_tool` 라우팅
+- [ ] `app/validators.py`에 인자 검증 추가
+- [ ] `app/policy.py` 리스크 등급 반영
+- [ ] 테스트 추가/수정 후 `pytest` 통과
+- [ ] `README.md` 툴 목록 업데이트
 
-```python
-# terminal.py / mcp_server.py — 수동 수정 불필요
-_VALID_TOOLS = {s["function"]["name"] for s in TOOL_SCHEMAS}
-```
+---
+
+## 참고
+
+- `_VALID_TOOLS`는 `TOOL_NAMES`에서 파생되어 자동 반영됩니다.
+- 일반 툴은 `entrypoints/mcp_server_main.py`의 `list_tools()`를 직접 수정할 필요가 없습니다.
